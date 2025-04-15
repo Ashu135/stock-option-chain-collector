@@ -1,0 +1,6 @@
+# Core dependencies
+requests
+lxml
+pymongo
+python-dotenv==1.0.0
+pytz
