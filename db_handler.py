@@ -54,6 +54,7 @@ class MongoDBHandler:
         # Save each strike price as a separate document
         strike_documents = []
         new_records_added = 0
+        duplicate_records = 0
         
         for option in options_data:
             strike_price = option['Strike Price']
@@ -61,6 +62,7 @@ class MongoDBHandler:
             
             # Skip if this strike price and time combination already exists
             if (strike_price, time_value) in existing_records:
+                duplicate_records += 1
                 continue
                 
             # This is a new record, add to the list for insertion
@@ -94,7 +96,7 @@ class MongoDBHandler:
             
             print(f"Data saved to MongoDB at {timestamp} - {new_records_added} new strike prices")
         else:
-            print(f"No new records to save at {timestamp}")
+            print(f"No new records to save at {timestamp} - Found {duplicate_records} duplicate records")
         
         return existing_records
     

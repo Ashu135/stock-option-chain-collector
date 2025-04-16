@@ -4,24 +4,26 @@ import sys
 from typing import Dict, Any, Set, Tuple
 from datetime import datetime, timedelta
 
-from api_client import NiftyAPIClient
+from api_client import NiftyAPIClient, SymbolConfig
 from formatters import get_middle_slice, format_option_data, format_totals
 from db_handler import MongoDBHandler
 from market_schedule import MarketSchedule
 
 class ResponseCache:
     def __init__(self):
-        self.previous_response = None
+        self.previous_responses = {}
     
-    def is_different_response(self, new_response: str) -> bool:
-        if self.previous_response is None or new_response != self.previous_response:
-            self.previous_response = new_response
+    def is_different_response(self, symbol: str, new_response: str) -> bool:
+        if symbol not in self.previous_responses or new_response != self.previous_responses[symbol]:
+            self.previous_responses[symbol] = new_response
             return True
+        print(f"Received identical API response for {symbol} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         return False
 
 class OptionsMonitor:
     def __init__(self, interval_seconds: int = 2):
         self.interval_seconds = interval_seconds
+        # Initialize with default Nifty configuration
         self.api_client = NiftyAPIClient()
         self.cache = ResponseCache()
         self.db_handler = MongoDBHandler()
@@ -30,9 +32,9 @@ class OptionsMonitor:
         # Load existing records from DB once at startup
         self.existing_records: Set[Tuple[float, str]] = self.db_handler.get_existing_records()
 
-    def process_data(self, result_data: Dict[str, Any]):
-        # Get middle 20 records from opDatas
-        middle_options = get_middle_slice(result_data["opDatas"], 20)
+    def process_data(self, symbol: str, result_data: Dict[str, Any], records_count: int):
+        # Get middle N records from opDatas based on configuration
+        middle_options = get_middle_slice(result_data["opDatas"], records_count)
         
         # Format option chain data
         formatted_data = [format_option_data(option) for option in middle_options]
@@ -42,8 +44,8 @@ class OptionsMonitor:
         
         return formatted_data, totals
 
-    def print_summary(self, totals: Dict[str, Any], formatted_data: list, new_records: bool):
-        print(f"\n=== Data Check at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+    def print_summary(self, symbol: str, totals: Dict[str, Any], formatted_data: list, new_records: bool):
+        print(f"\n=== Data Check for {symbol.upper()} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
         
         if new_records:
             print("New records found and saved to database.")
@@ -109,8 +111,9 @@ class OptionsMonitor:
         return False
 
     def run(self):
-        print(f"Starting Nifty options monitoring with market hours check...")
+        print(f"Starting options monitoring with market hours check...")
         print(f"Loaded {len(self.existing_records)} existing records from database")
+        print(f"Monitoring symbols: {', '.join(str(config) for config in self.api_client.symbols_config)}")
         print("Press Ctrl+C to stop monitoring\n")
         
         try:
@@ -132,39 +135,57 @@ class OptionsMonitor:
                         self.wait_for_market_open()
                         continue
                     
-                    # Fetch new data
-                    result_data = self.api_client.fetch_option_chain()
+                    # Record the start time of the cycle
+                    cycle_start_time = time.time()
                     
-                    if result_data:
-                        formatted_data, totals = self.process_data(result_data)
-                        
-                        # Check if there are any new records that don't exist in our cached set
-                        has_new_records = False
-                        for option in formatted_data:
-                            strike_price = option['Strike Price']
-                            time_value = option['Time']
-                            if (strike_price, time_value) not in self.existing_records:
-                                has_new_records = True
-                                break
+                    # Fetch new data for all symbols
+                    results = self.api_client.fetch_option_chain()
+                    
+                    for symbol, result_data in results.items():
+                        if result_data:
+                            # Find the configuration for this symbol
+                            symbol_config = next((config for config in self.api_client.symbols_config 
+                                               if config.symbol == symbol), None)
+                            if not symbol_config:
+                                continue
+
+                            # Check if response is same as previous
+                            if not self.cache.is_different_response(symbol, str(result_data)):
+                                continue
                                 
-                        # Only proceed with database operations if we have new records
-                        if has_new_records:
-                            # Update existing records with newly saved ones
-                            self.existing_records = self.db_handler.save_data(
-                                formatted_data, 
-                                totals,
-                                self.existing_records
-                            )
+                            formatted_data, totals = self.process_data(symbol, result_data, symbol_config.records_count)
                             
-                            # Print summary on a new line (after the clock)
-                            print()  # Move to new line after the clock
-                            self.print_summary(totals, formatted_data, True)
-                        else:
-                            # For regular updates without new data, don't print full summary
-                            pass
+                            # Check if there are any new records that don't exist in our cached set
+                            has_new_records = False
+                            for option in formatted_data:
+                                strike_price = option['Strike Price']
+                                time_value = option['Time']
+                                if (strike_price, time_value) not in self.existing_records:
+                                    has_new_records = True
+                                    break
+                                
+                            # Only proceed with database operations if we have new records
+                            if has_new_records:
+                                # Update existing records with newly saved ones
+                                self.existing_records = self.db_handler.save_data(
+                                    formatted_data, 
+                                    totals,
+                                    self.existing_records
+                                )
+                                
+                                # Print summary on a new line (after the clock)
+                                print()  # Move to new line after the clock
+                                self.print_summary(symbol, totals, formatted_data, True)
+                            else:
+                                print(f"\n=== Data Check for {symbol.upper()} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
+                                print("Skipping database update - All records already exist in database")
+                                print("=" * 50)
                     
-                    # Wait for the specified interval
-                    time.sleep(self.interval_seconds)
+                    # Calculate how long to wait until next cycle
+                    cycle_duration = time.time() - cycle_start_time
+                    wait_time = max(0, self.interval_seconds - cycle_duration)
+                    if wait_time > 0:
+                        time.sleep(wait_time)
                     
                 except KeyboardInterrupt:
                     raise
